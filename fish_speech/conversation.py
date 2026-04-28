@@ -14,6 +14,7 @@ from fish_speech.content_sequence import (
     VQPart,
 )
 from fish_speech.tokenizer import IM_END_TOKEN, IM_START_TOKEN, MODALITY_TOKENS
+from fish_speech.runtime import should_visualize_prompts
 
 
 @dataclass(kw_only=True)
@@ -114,6 +115,9 @@ class Conversation:
         Visualize the encoded sequence with color-coded tokens.
         Blue/cyan tokens contribute to loss, green tokens do not.
         """
+        if not should_visualize_prompts():
+            return
+
         # Build ContentSequence from messages and use its visualize method
         content_seq = self._build_content_sequence()
         content_seq.visualize(

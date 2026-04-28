@@ -9,6 +9,7 @@ import torchaudio
 from loguru import logger
 
 from fish_speech.models.dac.modded_dac import DAC
+from fish_speech.utils.audio import load_audio_tensor
 from fish_speech.utils.file import (
     AUDIO_EXTENSIONS,
     audio_to_bytes,
@@ -33,23 +34,8 @@ class ReferenceLoader:
         self.decoder_model: DAC
         self.encode_reference: Callable
 
-        # Define the torchaudio backend
-        # list_audio_backends() was removed in torchaudio 2.9
-        try:
-            backends = torchaudio.list_audio_backends()
-            if "ffmpeg" in backends:
-                self.backend = "ffmpeg"
-            else:
-                self.backend = "soundfile"
-        except AttributeError:
-            # torchaudio 2.9+ removed list_audio_backends()
-            # Try ffmpeg first, fallback to soundfile
-            try:
-                __import__("torchaudio.io._load_audio_fileobj")
-
-                self.backend = "ffmpeg"
-            except (ImportError, ModuleNotFoundError):
-                self.backend = "soundfile"
+        # Newer torchaudio routes through TorchCodec and ignores explicit backend
+        # selection, so let torchaudio choose the backend to avoid noisy warnings.
 
     @staticmethod
     def _validate_id(id: str) -> None:
@@ -138,7 +124,7 @@ class ReferenceLoader:
             audio_data = reference_audio
             reference_audio = io.BytesIO(audio_data)
 
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+        waveform, original_sr = load_audio_tensor(reference_audio)
 
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)

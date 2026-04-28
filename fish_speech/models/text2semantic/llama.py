@@ -16,6 +16,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
+from fish_speech.runtime import get_runtime_config
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -246,6 +247,71 @@ def _remap_fish_qwen3_omni_keys(weights: OrderedDict) -> OrderedDict:
     return new_weights
 
 
+def _remap_fish_qwen3_omni_key(key: str) -> str:
+    if key.startswith("text_model.model."):
+        return key[len("text_model.model.") :]
+    if key.startswith("audio_decoder."):
+        suffix = key[len("audio_decoder.") :]
+        return suffix if suffix.startswith("codebook_embeddings.") else "fast_" + suffix
+    return key
+
+
+def _get_quantized_weight_names(path: Path) -> set[str]:
+    manifest_path = path / "quantization_manifest.json"
+    if not manifest_path.exists():
+        return set()
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    quantized_weights = set()
+    for key, info in manifest.items():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("quant", "")).startswith("int8"):
+            quantized_weights.add(_remap_fish_qwen3_omni_key(key))
+
+    return quantized_weights
+
+
+def _rename_quantized_scale_keys(weights: OrderedDict) -> OrderedDict:
+    renamed = OrderedDict()
+    for key, value in weights.items():
+        if key.endswith(".weight.quant_scale"):
+            key = key[: -len(".weight.quant_scale")] + ".scales"
+        renamed[key] = value
+    return renamed
+
+
+def _replace_named_linears_with_int8(module: nn.Module, weight_names: set[str]) -> None:
+    from tools.llama.quantize import WeightOnlyInt8Linear
+
+    backend = get_runtime_config().int8_backend
+    for module_name, child in list(module.named_children()):
+        child_prefix = module_name
+        matching_weights = {
+            name[len(child_prefix) + 1 :]
+            for name in weight_names
+            if name.startswith(child_prefix + ".")
+        }
+
+        if isinstance(child, nn.Linear) and "weight" in matching_weights:
+            setattr(
+                module,
+                module_name,
+                WeightOnlyInt8Linear(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    backend=backend,
+                ),
+            )
+            continue
+
+        if matching_weights:
+            _replace_named_linears_with_int8(child, matching_weights)
+
+
 class BaseTransformer(nn.Module):
     def __init__(
         self,
@@ -287,13 +353,7 @@ class BaseTransformer(nn.Module):
         )
         self.register_buffer(
             "causal_mask",
-            torch.tril(
-                torch.ones(
-                    config.max_seq_len,
-                    config.max_seq_len,
-                    dtype=torch.bool,
-                )
-            ),
+            torch.empty(0, 0, dtype=torch.bool),
             persistent=False,
         )
 
@@ -313,6 +373,7 @@ class BaseTransformer(nn.Module):
         max_seq_len = find_multiple(max_seq_len, 8)
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self._get_causal_mask(max_seq_len, self.freqs_cis.device)
 
         for b in self.layers:
             b.attention.kv_cache = KVCache(
@@ -322,6 +383,17 @@ class BaseTransformer(nn.Module):
                 self.config.head_dim,
                 dtype=dtype,
             )
+
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> Tensor:
+        if (
+            self.causal_mask.device != device
+            or self.causal_mask.size(0) < seq_len
+            or self.causal_mask.size(1) < seq_len
+        ):
+            self.causal_mask = torch.tril(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+            )
+        return self.causal_mask[:seq_len, :seq_len]
 
     def embed(self, inp: Tensor) -> Tensor:
         embeds = []
@@ -358,7 +430,7 @@ class BaseTransformer(nn.Module):
 
         mask = None
         if key_padding_mask is not None:
-            causal = self.causal_mask[:seq_len, :seq_len]
+            causal = self._get_causal_mask(seq_len, inp.device)
             causal = rearrange(causal, "q k -> 1 1 q k")
 
             atten_mask = rearrange(key_padding_mask, "b s -> b 1 1 s")
@@ -438,7 +510,8 @@ class BaseTransformer(nn.Module):
         else:
             max_seq_len = self.max_seq_len
 
-        mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
+        causal_mask = self._get_causal_mask(max_seq_len, x.device)
+        mask = causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
         freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
@@ -526,7 +599,15 @@ class BaseTransformer(nn.Module):
         if load_weights is False:
             logger.info("Randomly initialized model")
         else:
-            if "int8" in str(Path(path)):
+            path_obj = Path(path)
+            quantized_weight_names = _get_quantized_weight_names(path_obj)
+
+            if quantized_weight_names:
+                logger.info(
+                    f"Using manifest-defined int8 weight-only quantization for {len(quantized_weight_names)} layers"
+                )
+                _replace_named_linears_with_int8(model, quantized_weight_names)
+            elif "int8" in str(Path(path)):
                 logger.info("Using int8 weight-only quantization!")
                 from tools.llama.quantize import WeightOnlyInt8QuantHandler
 
@@ -543,7 +624,6 @@ class BaseTransformer(nn.Module):
                 simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
                 model = simple_quantizer.convert_for_runtime()
 
-            path_obj = Path(path)
             index_json = path_obj / "model.safetensors.index.json"
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
@@ -559,12 +639,14 @@ class BaseTransformer(nn.Module):
                 for shard in shard_files:
                     weights.update(st_load_file(str(path_obj / shard), device="cpu"))
                 weights = _remap_fish_qwen3_omni_keys(weights)
+                weights = _rename_quantized_scale_keys(weights)
             elif single_st.exists():
                 logger.info("Loading single safetensors weights")
                 from safetensors.torch import load_file as st_load_file
 
                 weights = OrderedDict(st_load_file(str(single_st), device="cpu"))
                 weights = _remap_fish_qwen3_omni_keys(weights)
+                weights = _rename_quantized_scale_keys(weights)
             elif pth_file.exists():
                 weights = torch.load(
                     pth_file,
@@ -581,6 +663,7 @@ class BaseTransformer(nn.Module):
                 for k in list(weights.keys()):
                     if "audio_" in k:
                         weights.pop(k)
+                weights = _rename_quantized_scale_keys(weights)
             else:
                 raise FileNotFoundError(f"No model weights found in {path_obj}")
 
@@ -741,7 +824,8 @@ class DualARTransformer(BaseTransformer):
 
         # Fast transformer
         fast_seq_len = self.config.num_codebooks
-        fast_mask = self.causal_mask[
+        causal_mask = self._get_causal_mask(fast_seq_len, inp.device)
+        fast_mask = causal_mask[
             None, None, :fast_seq_len, :fast_seq_len
         ]  # (B, N, Q, K)
         fast_freqs_cis = self.fast_freqs_cis[:fast_seq_len]
@@ -802,7 +886,8 @@ class DualARTransformer(BaseTransformer):
         # Fast transformer
         x = x.view(x.shape[0], 1, -1)
 
-        fast_mask = self.causal_mask[
+        causal_mask = self._get_causal_mask(self.config.num_codebooks, x.device)
+        fast_mask = causal_mask[
             None, None, input_pos, : self.config.num_codebooks
         ]  # (B, N, Q, K)
         fast_freqs_cis = self.fast_freqs_cis[input_pos]

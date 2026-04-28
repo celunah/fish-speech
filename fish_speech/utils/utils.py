@@ -7,10 +7,11 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from .logger import RankedLogger
-from .rich_utils import enforce_tags, print_config_tree
 
-log = RankedLogger(__name__, rank_zero_only=True)
+def _log():
+    from .logger import RankedLogger
+
+    return RankedLogger(__name__, rank_zero_only=True)
 
 
 def extras(cfg: DictConfig) -> None:
@@ -24,22 +25,26 @@ def extras(cfg: DictConfig) -> None:
 
     # return if no `extras` config
     if not cfg.get("extras"):
-        log.warning("Extras config not found! <cfg.extras=null>")
+        _log().warning("Extras config not found! <cfg.extras=null>")
         return
 
     # disable python warnings
     if cfg.extras.get("ignore_warnings"):
-        log.info("Disabling python warnings! <cfg.extras.ignore_warnings=True>")
+        _log().info("Disabling python warnings! <cfg.extras.ignore_warnings=True>")
         warnings.filterwarnings("ignore")
 
     # prompt user to input tags from command line if none are provided in the config
     if cfg.extras.get("enforce_tags"):
-        log.info("Enforcing tags! <cfg.extras.enforce_tags=True>")
+        from .rich_utils import enforce_tags
+
+        _log().info("Enforcing tags! <cfg.extras.enforce_tags=True>")
         enforce_tags(cfg, save_to_file=True)
 
     # pretty print config tree using Rich library
     if cfg.extras.get("print_config"):
-        log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
+        from .rich_utils import print_config_tree
+
+        _log().info("Printing config tree with Rich! <cfg.extras.print_config=True>")
         print_config_tree(cfg, resolve=True, save_to_file=True)
 
 
@@ -71,7 +76,7 @@ def task_wrapper(task_func: Callable) -> Callable:
         # things to do if exception occurs
         except Exception as ex:
             # save exception to `.log` file
-            log.exception("")
+            _log().exception("")
 
             # some hyperparameter combinations might be invalid or
             # cause out-of-memory errors so when using hparam search
@@ -82,14 +87,14 @@ def task_wrapper(task_func: Callable) -> Callable:
         # things to always do after either success or exception
         finally:
             # display output dir path in terminal
-            log.info(f"Output dir: {cfg.paths.run_dir}")
+            _log().info(f"Output dir: {cfg.paths.run_dir}")
 
             # always close wandb run (even if exception occurs so multirun won't fail)
             if find_spec("wandb"):  # check if wandb is installed
                 import wandb
 
                 if wandb.run:
-                    log.info("Closing wandb!")
+                    _log().info("Closing wandb!")
                     wandb.finish()
 
         return metric_dict, object_dict
@@ -101,7 +106,7 @@ def get_metric_value(metric_dict: dict, metric_name: str) -> float:
     """Safely retrieves value of the metric logged in LightningModule."""
 
     if not metric_name:
-        log.info("Metric name is None! Skipping metric value retrieval...")
+        _log().info("Metric name is None! Skipping metric value retrieval...")
         return None
 
     if metric_name not in metric_dict:
@@ -112,7 +117,7 @@ def get_metric_value(metric_dict: dict, metric_name: str) -> float:
         )
 
     metric_value = metric_dict[metric_name].item()
-    log.info(f"Retrieved metric value! <{metric_name}={metric_value}>")
+    _log().info(f"Retrieved metric value! <{metric_name}={metric_value}>")
 
     return metric_value
 

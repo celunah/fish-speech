@@ -1,3 +1,4 @@
+import gc
 import os
 import queue
 import re
@@ -38,6 +39,14 @@ from fish_speech.models.text2semantic.llama import (
     DualARTransformer,
     NaiveTransformer,
 )
+from fish_speech.models.text2semantic.cudagraphs import CudaGraphHotPath
+from fish_speech.runtime import (
+    configure_logging,
+    configure_warning_filters,
+    get_runtime_config,
+    log_benchmark,
+)
+from fish_speech.utils.audio import load_audio_tensor
 
 
 def multinomial_sample_one_no_sync(probs_sort):
@@ -105,12 +114,21 @@ def decode_one_token_ar(
     audio_parts: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    forward_result = model.forward_generate(
-        x,
-        input_pos,
-        audio_masks=audio_masks,
-        audio_parts=audio_parts,
-    )
+    graph_hot_path = getattr(model, "_cuda_graph_hot_path", None)
+    if graph_hot_path is not None:
+        forward_result = graph_hot_path.forward_generate(
+            x,
+            input_pos,
+            audio_masks=audio_masks,
+            audio_parts=audio_parts,
+        )
+    else:
+        forward_result = model.forward_generate(
+            x,
+            input_pos,
+            audio_masks=audio_masks,
+            audio_parts=audio_parts,
+        )
     logits = forward_result.logits  # (1, 1, vocab_size)
     hidden_states = forward_result.hidden_states
 
@@ -146,7 +164,10 @@ def decode_one_token_ar(
     codebooks = [main_token_normal]
 
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
-    model.forward_generate_fast(hidden_states, input_pos)
+    if graph_hot_path is not None:
+        graph_hot_path.forward_generate_fast(hidden_states, input_pos)
+    else:
+        model.forward_generate_fast(hidden_states, input_pos)
 
     a = codebooks[0] - model.config.semantic_begin_id
     a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
@@ -158,7 +179,10 @@ def decode_one_token_ar(
         input_pos = torch.tensor(
             [codebook_idx], device=hidden_states.device, dtype=torch.long
         )
-        logits = model.forward_generate_fast(hidden_states, input_pos)
+        if graph_hot_path is not None:
+            logits = graph_hot_path.forward_generate_fast(hidden_states, input_pos)
+        else:
+            logits = model.forward_generate_fast(hidden_states, input_pos)
 
         short_logits = logits  # DualAR predicts config.codebook_size number of tokens
 
@@ -193,6 +217,7 @@ def decode_n_tokens(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
+    cancel_event: threading.Event | None = None,
 ):
     # Rolling window for RAS (Repetition Aware Sampling)
     previous_tokens = torch.zeros(
@@ -206,34 +231,41 @@ def decode_n_tokens(
     # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
 
-    for i in tqdm(range(num_new_tokens)):
-        with sdpa_kernel(SDPBackend.MATH):
-            next_token = decode_one_token(
-                model=model,
-                x=cur_token,
-                input_pos=input_pos,
-                previous_tokens=previous_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                semantic_logit_bias=semantic_logit_bias,
-                audio_masks=audio_masks,
-                audio_parts=audio_parts,
-            ).clone()
+    with tqdm(range(num_new_tokens)) as progress:
+        for _ in progress:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
 
-        input_pos += 1
-        cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        # Roll RAS window left and insert new token at end
-        previous_tokens = previous_tokens.roll(-1, dims=1)
-        previous_tokens[:, -1] = next_token.view(model.config.num_codebooks + 1, -1)[
-            :, 0
-        ]
-        new_tokens.append(next_token)
+            with sdpa_kernel(SDPBackend.MATH):
+                next_token = decode_one_token(
+                    model=model,
+                    x=cur_token,
+                    input_pos=input_pos,
+                    previous_tokens=previous_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=None,
+                    audio_parts=None,
+                ).clone()
 
-        if cur_token[0, 0, -1] == im_end_id:
-            break
+            input_pos += 1
+            cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
+            # Roll RAS window left and insert new token at end
+            previous_tokens = previous_tokens.roll(-1, dims=1)
+            previous_tokens[:, -1] = next_token.view(
+                model.config.num_codebooks + 1, -1
+            )[:, 0]
+            new_tokens.append(next_token)
+
+            if cur_token[0, 0, -1] == im_end_id:
+                break
 
     del cur_token
+
+    if not new_tokens:
+        raise KeyboardInterrupt
 
     return torch.cat(new_tokens, dim=1)
 
@@ -249,6 +281,7 @@ def generate(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
     num_samples: int = 1,
+    cancel_event: threading.Event | None = None,
     **sampling_kwargs,
 ):
     """
@@ -278,22 +311,20 @@ def generate(
         model.parameters()
     ).dtype  # model weight dtype (bfloat16), NOT prompt dtype (int32)
 
-    # Critical fix: Only set up cache on first run or when necessary
-    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
-            )
-        model._cache_setup_done = True
+    cache_seq_len = max(T_new, T + 1)
+    with torch.device(device):
+        model.setup_caches(
+            max_batch_size=1,  # Fixed to 1, avoid dynamic changes
+            max_seq_len=cache_seq_len,
+            dtype=next(model.parameters()).dtype,
+        )
 
     codebook_dim = 1 + model.config.num_codebooks
 
     # Create new tensor each time, but try to reuse memory
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
     empty = torch.empty(
-        (codebook_dim, model.config.max_seq_len), dtype=prompt.dtype, device=device
+        (codebook_dim, T_new), dtype=prompt.dtype, device=device
     )
     empty[:, :T] = prompt
     seq = empty
@@ -332,6 +363,9 @@ def generate(
         audio_masks,
         audio_parts,
     )
+    if cancel_event is not None and cancel_event.is_set():
+        raise KeyboardInterrupt
+
     seq[:, T : T + 1] = first_token
 
     # Recreate input_pos
@@ -349,6 +383,7 @@ def generate(
         audio_masks=audio_masks,
         audio_parts=audio_parts,
         decode_one_token=decode_one_token,
+        cancel_event=cancel_event,
     )
     seq = seq[:, : T + 1 + x.size(1)]
     seq[:, T + 1 :] = x
@@ -360,9 +395,16 @@ def generate(
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
+    runtime_config = get_runtime_config()
+    configure_logging(runtime_config)
     model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
 
-    model = model.to(device=device, dtype=precision)
+    checkpoint_path = Path(checkpoint_path)
+    if (checkpoint_path / "quantization_manifest.json").exists():
+        logger.info("Preserving checkpoint tensor dtypes from quantization manifest")
+        model = model.to(device=device)
+    else:
+        model = model.to(device=device, dtype=precision)
     logger.info(f"Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
@@ -377,9 +419,6 @@ def init_model(checkpoint_path, device, precision, compile=False):
     model.fixed_top_p = torch.tensor(0.7, device=device, dtype=torch.float)
     model.fixed_repetition_penalty = torch.tensor(1.5, device=device, dtype=torch.float)
 
-    # Mark whether cache has been initialized
-    model._cache_setup_done = False
-
     if compile:
         logger.info("Compiling function...")
         decode_one_token = torch.compile(
@@ -389,12 +428,20 @@ def init_model(checkpoint_path, device, precision, compile=False):
             fullgraph=True,
         )
 
+    device_obj = torch.device(device)
+    if runtime_config.use_cudagraphs and CudaGraphHotPath.can_enable(device_obj):
+        model._cuda_graph_hot_path = CudaGraphHotPath(model)
+        logger.info("CUDA graph mode enabled for token generation hot path")
+    elif runtime_config.use_cudagraphs:
+        logger.warning("CUDA graph mode requested but disabled because device is not CUDA")
+
     return model.eval(), decode_one_token
 
 
 @torch.inference_mode()
 def load_codec_model(codec_checkpoint_path, device, precision=torch.bfloat16):
     """Load the DAC codec model for audio encoding/decoding."""
+    configure_warning_filters()
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
 
@@ -422,7 +469,7 @@ def encode_audio(audio_path, codec, device):
     """Encode an audio file to VQ codes."""
     import torchaudio
 
-    wav, sr = torchaudio.load(str(audio_path))
+    wav, sr = load_audio_tensor(audio_path)
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     wav = torchaudio.functional.resample(wav.to(device), sr, codec.sample_rate)[0]
@@ -537,7 +584,9 @@ def generate_long(
     chunk_length: int = 512,
     prompt_text: Optional[Union[str, list[str]]] = None,
     prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+    cancel_event: threading.Event | None = None,
 ):
+    runtime_config = get_runtime_config()
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
@@ -606,9 +655,13 @@ def generate_long(
     else:
         batches = [text]
 
-    logger.info(f"Split into {len(turns)} turns, grouped into {len(batches)} batches")
+    if runtime_config.dev_mode:
+        logger.info(f"Split into {len(turns)} turns, grouped into {len(batches)} batches")
 
     for sample_idx in range(num_samples):
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -618,11 +671,15 @@ def generate_long(
         conversation = deepcopy(base_conversation)
 
         for batch_idx, batch_text in enumerate(batches):
-            logger.info(
-                f"--- Sample {sample_idx}, Batch {batch_idx} "
-                f"({len(batch_text.encode('utf-8'))} bytes) ---"
-            )
-            logger.info(f"Batch text: {batch_text}")
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
+
+            if runtime_config.dev_mode:
+                logger.info(
+                    f"--- Sample {sample_idx}, Batch {batch_idx} "
+                    f"({len(batch_text.encode('utf-8'))} bytes) ---"
+                )
+                logger.info(f"Batch text: {batch_text}")
 
             # Add user message
             conversation.append(
@@ -648,7 +705,8 @@ def generate_long(
                 )
             )
 
-            logger.info("Visualizing prompt structure:")
+            if runtime_config.dev_mode:
+                logger.info("Visualizing prompt structure:")
             conversation_gen.visualize(
                 tokenizer,
                 merge_audio_tokens=True,
@@ -659,10 +717,11 @@ def generate_long(
                 tokenizer, num_codebooks=model.config.num_codebooks
             )
 
-            logger.info(f"Encoded prompt shape: {encoded.shape}")
-            if audio_parts is not None:
+            if runtime_config.dev_mode:
+                logger.info(f"Encoded prompt shape: {encoded.shape}")
+            if runtime_config.dev_mode and audio_parts is not None:
                 logger.info(f"Audio parts shape: {audio_parts.shape}")
-            if audio_masks is not None:
+            if runtime_config.dev_mode and audio_masks is not None:
                 logger.info(
                     f"Audio masks non-zero count: {torch.count_nonzero(audio_masks)}"
                 )
@@ -682,6 +741,7 @@ def generate_long(
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
                 decode_one_token=decode_one_token,
+                cancel_event=cancel_event,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
@@ -696,13 +756,24 @@ def generate_long(
             t_batch = time.perf_counter() - t0
             tokens_generated = y.size(1) - prompt_length
             tokens_sec = tokens_generated / t_batch if t_batch > 0 else 0
-            logger.info(
-                f"Batch {batch_idx}: Generated {tokens_generated} tokens in "
-                f"{t_batch:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+            vram_gb = (
+                torch.cuda.max_memory_reserved() / 1e9
+                if torch.cuda.is_available()
+                else None
             )
-            logger.info(
-                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
+            log_benchmark(
+                tokens_sec=tokens_sec,
+                latency_sec=t_batch,
+                vram_gb=vram_gb,
+                config=runtime_config,
             )
+            graph_hot_path = getattr(model, "_cuda_graph_hot_path", None)
+            if graph_hot_path is not None and runtime_config.verbose:
+                logger.info(f"cudagraph stats: {graph_hot_path.stats()}")
+            if runtime_config.dev_mode:
+                logger.info(
+                    f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
+                )
 
             # Extract generated codes
             codes = y[1:, prompt_length:-1].clone()
@@ -725,7 +796,7 @@ def generate_long(
             # Cleanup
             del y, encoded
 
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and runtime_config.dev_mode:
             logger.info(
                 f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
             )
@@ -743,6 +814,7 @@ class WrappedGenerateResponse:
 class GenerateRequest:
     request: dict
     response_queue: queue.Queue
+    cancel_event: threading.Event | None = None
 
 
 def launch_thread_safe_queue(
@@ -752,49 +824,68 @@ def launch_thread_safe_queue(
     compile: bool = False,
 ):
     input_queue = queue.Queue()
+    input_queue.device = torch.device(device)
     init_event = threading.Event()
 
     def worker():
-        model, decode_one_token = init_model(
-            checkpoint_path, device, precision, compile=compile
-        )
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
+        model = None
+        decode_one_token = None
+        try:
+            model, decode_one_token = init_model(
+                checkpoint_path, device, precision, compile=compile
             )
-        init_event.set()
+            init_event.set()
 
-        while True:
-            item: GenerateRequest | None = input_queue.get()
-            if item is None:
-                break
+            while True:
+                item: GenerateRequest | None = input_queue.get()
+                if item is None:
+                    break
 
-            kwargs = item.request
-            response_queue = item.response_queue
+                kwargs = item.request
+                response_queue = item.response_queue
 
+                try:
+                    kwargs["cancel_event"] = item.cancel_event
+                    for chunk in generate_long(
+                        model=model, decode_one_token=decode_one_token, **kwargs
+                    ):
+                        if item.cancel_event is not None and item.cancel_event.is_set():
+                            break
+                        response_queue.put(
+                            WrappedGenerateResponse(status="success", response=chunk)
+                        )
+
+                    # Only clear cache after complete request batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except KeyboardInterrupt as e:
+                    logger.warning("Generation cancelled")
+                    response_queue.put(WrappedGenerateResponse(status="error", response=e))
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    logger.error(traceback.format_exc())
+                    response_queue.put(WrappedGenerateResponse(status="error", response=e))
+                    # Clear cache on error
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        finally:
+            del model, decode_one_token
             try:
-                for chunk in generate_long(
-                    model=model, decode_one_token=decode_one_token, **kwargs
-                ):
-                    response_queue.put(
-                        WrappedGenerateResponse(status="success", response=chunk)
-                    )
+                from tools.llama.quantize import clear_int8_dequant_cache
 
-                # Only clear cache after complete request batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                clear_int8_dequant_cache()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-            except Exception as e:
-                logger.error(traceback.format_exc())
-                response_queue.put(WrappedGenerateResponse(status="error", response=e))
-                # Clear cache on error
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-    threading.Thread(target=worker, daemon=True).start()
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
     init_event.wait()
+    input_queue.worker_thread = worker_thread
 
     return input_queue
 
@@ -877,12 +968,6 @@ def main(
     model, decode_one_token = init_model(
         checkpoint_path, device, precision, compile=compile
     )
-    with torch.device(device):
-        model.setup_caches(
-            max_batch_size=1,
-            max_seq_len=model.config.max_seq_len,
-            dtype=next(model.parameters()).dtype,
-        )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -928,38 +1013,49 @@ def main(
     idx = 0
     codes = []
 
-    for response in generator:
-        if response.action == "sample":
-            codes.append(response.codes)
-            logger.info(f"Sampled text: {response.text}")
-        elif response.action == "next":
-            if codes:
-                merged_codes = torch.cat(codes, dim=1)
-                codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
-                np.save(codes_npy_path, merged_codes.cpu().numpy())
-                logger.info(f"Saved codes to {codes_npy_path}")
+    try:
+        for response in generator:
+            if response.action == "sample":
+                codes.append(response.codes)
+                logger.info(f"Sampled text: {response.text}")
+            elif response.action == "next":
+                if codes:
+                    merged_codes = torch.cat(codes, dim=1)
+                    codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
+                    np.save(codes_npy_path, merged_codes.cpu().numpy())
+                    logger.info(f"Saved codes to {codes_npy_path}")
 
-                # Decode to wav if --output is specified
-                if output:
-                    if codec is None:
-                        logger.info("Loading codec model for audio decoding...")
-                        codec = load_codec_model(codec_checkpoint, device, precision)
-                    audio = decode_to_audio(merged_codes.to(device), codec)
-                    import soundfile as sf
+                    # Decode to wav if --output is specified
+                    if output:
+                        if codec is None:
+                            logger.info("Loading codec model for audio decoding...")
+                            codec = load_codec_model(
+                                codec_checkpoint, device, precision
+                            )
+                        audio = decode_to_audio(merged_codes.to(device), codec)
+                        import soundfile as sf
 
-                    out_path = (
-                        str(output)
-                        if num_samples == 1
-                        else str(output.with_stem(f"{output.stem}_{idx}"))
-                    )
-                    sf.write(out_path, audio.cpu().float().numpy(), codec.sample_rate)
-                    logger.info(f"Saved audio to {out_path}")
+                        out_path = (
+                            str(output)
+                            if num_samples == 1
+                            else str(output.with_stem(f"{output.stem}_{idx}"))
+                        )
+                        sf.write(
+                            out_path, audio.cpu().float().numpy(), codec.sample_rate
+                        )
+                        logger.info(f"Saved audio to {out_path}")
 
-            logger.info(f"Next sample")
-            codes = []
-            idx += 1
-        else:
-            logger.error(f"Error: {response}")
+                logger.info(f"Next sample")
+                codes = []
+                idx += 1
+            else:
+                logger.error(f"Error: {response}")
+    except KeyboardInterrupt:
+        generator.close()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.warning("Generation interrupted")
+        raise
 
 
 if __name__ == "__main__":

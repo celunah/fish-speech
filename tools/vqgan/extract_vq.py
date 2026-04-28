@@ -95,9 +95,9 @@ def process_batch(files: list[Path], model) -> float:
 
     for file in files:
         try:
-            wav, sr = torchaudio.load(
-                str(file), backend=backend
-            )  # Need to install libsox-dev
+            from fish_speech.utils.audio import load_audio_tensor
+
+            wav, sr = load_audio_tensor(file)
         except Exception as e:
             logger.error(f"Error reading {file}: {e}")
             continue

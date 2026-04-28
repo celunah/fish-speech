@@ -2,6 +2,8 @@
 # All rights reserved.
 import datetime
 import shutil
+import re
+from collections import OrderedDict
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
@@ -12,9 +14,11 @@ import click
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 
 from fish_speech.models.text2semantic.inference import init_model
 from fish_speech.models.text2semantic.llama import find_multiple
+from fish_speech.runtime import get_runtime_config, int8_dequant_cache_limit_bytes
 
 ##### Quantization Primitives ######
 
@@ -175,16 +179,34 @@ class QuantHandler:
 ##### Weight-only int8 per-channel quantized code ######
 
 
-def replace_linear_weight_only_int8_per_channel(module):
+def clear_int8_dequant_cache() -> None:
+    WeightOnlyInt8Linear._dequant_cache.clear()
+    WeightOnlyInt8Linear._dequant_cache_bytes = 0
+
+
+def _torch_version_at_least(major: int, minor: int) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)", torch.__version__)
+    if match is None:
+        return True
+    current = (int(match.group(1)), int(match.group(2)))
+    return current >= (major, minor)
+
+
+def replace_linear_weight_only_int8_per_channel(module, backend: str | None = None):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
             setattr(
                 module,
                 name,
-                WeightOnlyInt8Linear(child.in_features, child.out_features),
+                WeightOnlyInt8Linear(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    backend=backend,
+                ),
             )
         else:
-            replace_linear_weight_only_int8_per_channel(child)
+            replace_linear_weight_only_int8_per_channel(child, backend=backend)
 
 
 class WeightOnlyInt8QuantHandler:
@@ -205,7 +227,9 @@ class WeightOnlyInt8QuantHandler:
         return cur_state_dict
 
     def convert_for_runtime(self):
-        replace_linear_weight_only_int8_per_channel(self.mod)
+        replace_linear_weight_only_int8_per_channel(
+            self.mod, backend=get_runtime_config().int8_backend
+        )
         return self.mod
 
 
@@ -214,6 +238,11 @@ class WeightOnlyInt8Linear(torch.nn.Module):
     in_features: int
     out_features: int
     weight: torch.Tensor
+    _dequant_cache: OrderedDict[int, tuple[torch.Tensor, int]] = OrderedDict()
+    _dequant_cache_bytes: int = 0
+    _backend_warned: set[str] = set()
+    _backend_unavailable: set[str] = set()
+    _backend_skip_logged: set[str] = set()
 
     def __init__(
         self,
@@ -222,18 +251,170 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         bias: bool = True,
         device=None,
         dtype=None,
+        backend: str | None = None,
     ) -> None:
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.backend = backend or get_runtime_config().int8_backend
+        self._backend_module: nn.Module | None = None
+        self._backend_failed = False
         self.register_buffer(
             "weight", torch.empty((out_features, in_features), dtype=torch.int8)
         )
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def _dequant_cache_limit_bytes(cls) -> int:
+        return int8_dequant_cache_limit_bytes()
+
+    @classmethod
+    def _evict_dequant_cache(cls, bytes_needed: int) -> None:
+        limit = cls._dequant_cache_limit_bytes()
+        while cls._dequant_cache and cls._dequant_cache_bytes + bytes_needed > limit:
+            _, (_, cached_bytes) = cls._dequant_cache.popitem(last=False)
+            cls._dequant_cache_bytes -= cached_bytes
+
+    def _get_dequantized_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        limit = self._dequant_cache_limit_bytes()
+        if limit <= 0:
+            return self.weight.to(dtype=dtype) * self.scales[:, None].to(dtype=dtype)
+
+        cache_key = id(self)
+        cached = self._dequant_cache.get(cache_key)
+        if cached is not None:
+            weight, cached_bytes = cached
+            if weight.device == self.weight.device and weight.dtype == dtype:
+                self._dequant_cache.move_to_end(cache_key)
+                return weight
+            self._dequant_cache_bytes -= cached_bytes
+            self._dequant_cache.pop(cache_key, None)
+
+        weight = self.weight.to(dtype=dtype) * self.scales[:, None].to(dtype=dtype)
+        weight_bytes = weight.numel() * weight.element_size()
+        if weight_bytes <= limit:
+            self._evict_dequant_cache(weight_bytes)
+            self._dequant_cache[cache_key] = (weight, weight_bytes)
+            self._dequant_cache_bytes += weight_bytes
+        return weight
+
+    def _warn_backend_fallback(self, backend: str, exc: BaseException) -> None:
+        if backend in self._backend_warned:
+            return
+        self._backend_warned.add(backend)
+        logger.warning(
+            f"INT8 backend {backend!r} is unavailable for this layer; "
+            f"using hybrid INT8/BF16 fallback: {exc}"
+        )
+
+    def _build_torchao_linear(self, dtype: torch.dtype) -> nn.Module:
+        from torchao.quantization import Int8WeightOnlyConfig, quantize_
+
+        linear = nn.Linear(
+            self.in_features,
+            self.out_features,
+            bias=self.bias is not None,
+            device=self.weight.device,
+            dtype=dtype,
+        )
+        with torch.no_grad():
+            linear.weight.copy_(self._get_dequantized_weight(dtype))
+            if self.bias is not None and linear.bias is not None:
+                linear.bias.copy_(self.bias.to(dtype=dtype))
+        quantize_(linear, Int8WeightOnlyConfig())
+        return linear
+
+    def _build_bitsandbytes_linear(self, dtype: torch.dtype) -> nn.Module:
+        import bitsandbytes as bnb
+
+        if self.weight.device.type != "cuda":
+            raise RuntimeError("bitsandbytes INT8 inference requires CUDA tensors")
+        if dtype is torch.bfloat16:
+            raise RuntimeError(
+                "bitsandbytes Linear8bitLt casts BF16 activations to FP16; "
+                "use torchao or fallback to preserve BF16 inference"
+            )
+
+        linear = bnb.nn.Linear8bitLt(
+            self.in_features,
+            self.out_features,
+            bias=self.bias is not None,
+            has_fp16_weights=False,
+        ).to(device=self.weight.device)
+        with torch.no_grad():
+            linear.weight = bnb.nn.Int8Params(
+                self._get_dequantized_weight(dtype).contiguous(),
+                requires_grad=False,
+                has_fp16_weights=False,
+            ).to(self.weight.device)
+            if self.bias is not None and linear.bias is not None:
+                linear.bias.copy_(self.bias.to(device=self.weight.device, dtype=linear.bias.dtype))
+        return linear
+
+    def _get_backend_module(self, dtype: torch.dtype) -> nn.Module | None:
+        if self.backend == "fallback" or self._backend_failed:
+            return None
+        if self.weight.device.type != "cuda":
+            return None
+        if self._backend_module is not None:
+            return self._backend_module
+
+        candidates = (
+            ("torchao", "bitsandbytes")
+            if self.backend == "auto"
+            else (self.backend,)
+        )
+        for backend in candidates:
+            if backend in self._backend_unavailable:
+                continue
+            if backend == "bitsandbytes" and dtype is torch.bfloat16:
+                if backend not in self._backend_skip_logged:
+                    self._backend_skip_logged.add(backend)
+                    logger.info(
+                        "Skipping bitsandbytes INT8 backend for BF16 inputs; "
+                        "using torchao or hybrid INT8/BF16 fallback instead"
+                    )
+                self._backend_unavailable.add(backend)
+                continue
+            if backend == "torchao" and not _torch_version_at_least(2, 11):
+                if backend not in self._backend_skip_logged:
+                    self._backend_skip_logged.add(backend)
+                    logger.info(
+                        "Skipping torchao INT8 backend because it requires "
+                        f"torch >= 2.11.0; found {torch.__version__}. "
+                        "Using the hybrid INT8/BF16 fallback instead."
+                    )
+                self._backend_unavailable.add(backend)
+                continue
+            try:
+                if backend == "torchao":
+                    self._backend_module = self._build_torchao_linear(dtype)
+                elif backend == "bitsandbytes":
+                    self._backend_module = self._build_bitsandbytes_linear(dtype)
+                else:
+                    continue
+                logger.info(f"Using {backend} INT8 backend for weight-only Linear")
+                return self._backend_module
+            except Exception as exc:
+                self._warn_backend_fallback(backend, exc)
+                self._backend_unavailable.add(backend)
+
+        self._backend_failed = True
+        return None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        backend_module = self._get_backend_module(input.dtype)
+        if backend_module is not None:
+            return backend_module(input)
+        return F.linear(
+            input,
+            self._get_dequantized_weight(input.dtype),
+            None if self.bias is None else self.bias.to(dtype=input.dtype),
+        )
 
 
 ##### weight only int4 per channel groupwise quantized code ######

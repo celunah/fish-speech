@@ -3,26 +3,28 @@ from pathlib import Path
 import click
 import hydra
 import numpy as np
-import pyrootutils
 import soundfile as sf
 import torch
 import torchaudio
-from hydra import compose, initialize
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import OmegaConf
 
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
+from fish_speech.runtime import configure_warning_filters
+from fish_speech.utils.audio import load_audio_tensor
 from fish_speech.utils.file import AUDIO_EXTENSIONS
 
 # register eval resolver
-OmegaConf.register_new_resolver("eval", eval)
+if not OmegaConf.has_resolver("eval"):
+    OmegaConf.register_new_resolver("eval", eval)
 
 
 def load_model(config_name, checkpoint_path, device="cuda"):
+    configure_warning_filters()
     hydra.core.global_hydra.GlobalHydra.instance().clear()
-    with initialize(version_base="1.3", config_path="../../configs"):
+    config_dir = Path(__file__).resolve().parents[2] / "configs"
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         cfg = compose(config_name=config_name)
 
     model = instantiate(cfg)
@@ -75,7 +77,7 @@ def main(input_path, output_path, config_name, checkpoint_path, device):
         logger.info(f"Processing in-place reconstruction of {input_path}")
 
         # Load audio
-        audio, sr = torchaudio.load(str(input_path))
+        audio, sr = load_audio_tensor(input_path)
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
         audio = torchaudio.functional.resample(audio, sr, model.sample_rate)
