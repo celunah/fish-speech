@@ -4,7 +4,6 @@ import time
 import wave
 
 import ormsgpack
-import pyaudio
 import requests
 from pydub import AudioSegment
 from pydub.playback import play
@@ -198,31 +197,16 @@ if __name__ == "__main__":
 
     if response.status_code == 200:
         if args.streaming:
-            p = pyaudio.PyAudio()
-            audio_format = pyaudio.paInt16  # Assuming 16-bit PCM format
-            stream = p.open(
-                format=audio_format, channels=args.channels, rate=args.rate, output=True
-            )
-
             wf = wave.open(f"{args.output}.wav", "wb")
             wf.setnchannels(args.channels)
-            wf.setsampwidth(p.get_sample_size(audio_format))
+            wf.setsampwidth(2)  # 16-bit PCM
             wf.setframerate(args.rate)
-
-            stream_stopped_flag = False
 
             try:
                 for chunk in response.iter_content(chunk_size=1024):
                     if chunk:
-                        stream.write(chunk)
                         wf.writeframesraw(chunk)
-                    else:
-                        if not stream_stopped_flag:
-                            stream.stop_stream()
-                            stream_stopped_flag = True
             finally:
-                stream.close()
-                p.terminate()
                 wf.close()
         else:
             audio_content = response.content

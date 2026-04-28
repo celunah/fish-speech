@@ -26,10 +26,6 @@ pip install -e .[cpu]
 
 # 默认安装（使用 PyTorch 默认索引）
 pip install -e .
-
-# 如果因 pyaudio 导致安装报错，可以先执行：
-# conda install pyaudio
-# 然后重新执行 pip install -e .
 ```
 
 ### UV

@@ -28,9 +28,6 @@ pip install -e .[cpu]
 # Instalación por defecto (usa el índice por defecto de PyTorch)
 pip install -e .
 
-# Si encuentras un error durante la instalación debido a pyaudio, considera usar el siguiente comando:
-# conda install pyaudio
-# Luego ejecuta pip install -e . nuevamente
 ```
 
 ### UV

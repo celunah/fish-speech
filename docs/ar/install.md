@@ -26,10 +26,6 @@ pip install -e .[cpu]
 
 # التثبيت الافتراضي (يستخدم فهرس PyTorch الافتراضي)
 pip install -e .
-
-# إذا واجهت خطأ أثناء التثبيت بسبب pyaudio، ففكر في استخدام الأمر التالي:
-# conda install pyaudio
-# ثم قم بتشغيل pip install -e . مرة أخرى
 ```
 
 ### UV

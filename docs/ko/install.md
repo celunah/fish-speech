@@ -26,10 +26,6 @@ pip install -e .[cpu]
 
 # 기본 설치 (PyTorch 기본 인덱스 사용)
 pip install -e .
-
-# pyaudio 설치 중 오류가 발생하면 다음 명령을 사용해 보세요:
-# conda install pyaudio
-# 그런 다음 pip install -e . 를 다시 실행하세요
 ```
 
 ### UV
